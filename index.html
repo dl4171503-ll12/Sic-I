@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SIC 01 · 村落建设</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #06080c;
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Courier New", monospace; overflow: hidden; user-select: none;
+  }
+  canvas {
+    display: block; width: 1152px; height: 690px;
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    box-shadow: 0 0 0 3px #1b2418, 0 0 70px rgba(70,120,60,.25);
+    background: #0a0f14; cursor: crosshair;
+  }
+  @media (max-width: 1180px) { canvas { width: 96vw; height: auto; } }
+</style>
+</head>
+<body>
+<canvas id="c" width="384" height="230"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  // ═══════════ 基础 ═══════════
+  const VW = 384, VH = 230, TW = 32, TH = 16, HW = 16, HH = 8;
+  const MAP = 26, HUD_H = 30;
+  const cv = document.getElementById("c");
+  const ctx = cv.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+
+  // ═══════════ 经济参数（balance_sweep.py 验证过） ═══════════
+  const COST   = { road:10, house:60, shop:90, factory:120, farm:30, well:40, church:150, warehouse:100, market:110 };
+  const UPKEEP = { road:0.12, house:0.25, shop:0.35, factory:0.45, farm:0.15, well:0.25 };
+  const UPKEEP_MUL = 1.4;
+  const CAP_HOUSE = 6, CAP_SHOP = 6, CAP_FACTORY = 10;
+  const FOOD_PER_FARM = 12, WATER_PER_WELL = 14;
+  const TAX_CITIZEN = 0.30, TAX_SHOP = 0.20, TAX_FACTORY = 0.10;
+  const START_MONEY = 2000, GOAL_POP = 100, TICK = 0.6;
+
+  // ═══════════ 贴图 ═══════════
+  const FILES = {
+    grass_0:"assets_final/grass_0.png",
+    water_0:"assets_final/water_0.png",
+    road_0:"assets_final/road_0.png",
+    road_iso:"assets_final/road_iso.png",
+    road_ns:"assets_final/road_ns.png",
+    road_ew:"assets_final/road_ew.png",
+    road_cross:"assets_final/road_cross.png",
+    road_ne:"assets_final/road_ne.png",
+    road_es:"assets_final/road_es.png",
+    road_sw:"assets_final/road_sw.png",
+    road_wn:"assets_final/road_wn.png",
+    road_end_n:"assets_final/road_end_n.png",
+    road_end_s:"assets_final/road_end_s.png",
+    house_0:"assets_final/house_0.png", house_1:"assets_final/house_1.png",
+    shop_0:"assets_final/shop_0.png",   shop_1:"assets_final/shop_1.png",
+    factory_0:"assets_final/factory_0.png", factory_1:"assets_final/factory_1.png",
+    farm_0:"assets_final/farm_0.png",   well_0:"assets_final/well_0.png",
+    church_0:"assets_final/church_0.png",
+    warehouse_0:"assets_final/warehouse_0.png",
+    market_0:"assets_final/market_0.png",
+    tree_0:"assets_final/tree_0.png",   tree_1:"assets_final/tree_1.png"
+  };  const IMG = {};
+  let loaded = 0;
+  const total = Object.keys(FILES).length;
+  for (const k in FILES) {
+    const im = new Image();
+    im.onload = () => loaded++;
+    im.onerror = () => { console.error("missing " + FILES[k]); loaded++; };
+    im.src = FILES[k];
+    IMG[k] = im;
+  }
+
+  // ═══════════ 地形类型 ═══════════
+  const T = { GRASS:0, GRASS2:1, WATER:2, ROAD:3, HOUSE:4, SHOP:5, FACTORY:6, FARM:7, WELL:8, TREE:9, CHURCH:10, WAREHOUSE:11, MARKET:12 };
+  const KIND = { 3:"road", 4:"house", 5:"shop", 6:"factory", 7:"farm", 8:"well", 10:"church", 11:"warehouse", 12:"market" };
+
+  const map = [];
+  for (let r = 0; r < MAP; r++) {
+    const row = [];
+    for (let c = 0; c < MAP; c++) {
+      let t = ((r + c) % 2) ? T.GRASS : T.GRASS2;
+      if ((r * 13 + c * 7) % 29 === 0) t = T.TREE;
+      row.push({ t: t, pop: 0, rot: 0, tv: (r * 7 + c * 3) % 3 });
+    }
+    map.push(row);
+  }
+  // 小河
+  for (let i = 0; i < MAP; i++) {
+    const r = 4 + Math.floor(i / 4);
+    if (r < MAP) map[r][i].t = T.WATER;
+    if (r + 1 < MAP) map[r + 1][i].t = T.WATER;
+  }
+
+// ═══════════════════════════════════════════
+// 地形高度系统（2.5D 山坡 + 悬崖面）
+// ═══════════════════════════════════════════
+const ELEV_STEP = 12;          // 每级高度抬升 9 像素
+const ELEV_MAX = 3;           // 最高 3 级（大块平台）
+
+// 平滑高度噪声（确定性，不随时间变）
+function heightNoise(c, r) {
+  const v =
+    Math.sin(c * 0.29 + r * 0.11) * 0.55 +
+    Math.cos(r * 0.26 - c * 0.07) * 0.55 +
+    Math.sin((c + r) * 0.14 + 1.3) * 0.40 +
+    Math.cos(c * 0.09 - r * 0.21 + 2.1) * 0.30;
+  return v;
+}
+
+  function buildHeights() {
+    // 原始噪声
+    let cur = [];
+    for (let r = 0; r < MAP; r++) {
+      cur.push([]);
+      for (let c = 0; c < MAP; c++) cur[r].push(heightNoise(c, r));
+    }
+    // 4 轮大核平滑 → 大块台地，不是碎楼梯
+    for (let pass = 0; pass < 4; pass++) {
+      const sm = [];
+      for (let r = 0; r < MAP; r++) {
+        sm.push([]);
+        for (let c = 0; c < MAP; c++) {
+          let s2 = 0, n = 0;
+          for (let dr = -2; dr <= 2; dr++) {
+            for (let dc = -2; dc <= 2; dc++) {
+              const rr = r + dr, cc = c + dc;
+              if (rr < 0 || rr >= MAP || cc < 0 || cc >= MAP) continue;
+              s2 += cur[rr][cc]; n++;
+            }
+          }
+          sm[r].push(s2 / n);
+        }
+      }
+      cur = sm;
+    }
+    // 映射到 0..ELEV_MAX
+    let mn = 1e9, mx = -1e9;
+    for (let r = 0; r < MAP; r++) for (let c = 0; c < MAP; c++) {
+      if (cur[r][c] < mn) mn = cur[r][c];
+      if (cur[r][c] > mx) mx = cur[r][c];
+    }
+    const span = Math.max(0.001, mx - mn);
+    for (let r = 0; r < MAP; r++) {
+      for (let c = 0; c < MAP; c++) {
+        const t = (cur[r][c] - mn) / span;
+        map[r][c].h = Math.max(0, Math.min(ELEV_MAX, Math.round(t * ELEV_MAX)));
+      }
+    }
+    // 开局区域整体削平成一块台地
+    for (let r = 8; r <= 20; r++) {
+      for (let c = 6; c <= 22; c++) {
+        if (r >= 0 && r < MAP && c >= 0 && c < MAP) map[r][c].h = 2;
+      }
+    }
+    // 河面压到最低
+    for (let r = 0; r < MAP; r++) {
+      for (let c = 0; c < MAP; c++) {
+        if (map[r][c].t === T.WATER) map[r][c].h = 1;
+      }
+    }
+  }
+
+
+  // ═══════════ 开局赠送的小村落（避免开局破产） ═══════════
+  let houseCount = 2;
+  function placeStart() {
+    const c0 = 12, r0 = 14;
+    for (let i = 0; i < 9; i++) map[r0][c0 + i].t = T.ROAD;   // 天然道路
+    // 建筑拉开距离，避免贴图互相压盖
+    map[r0 - 1][c0 + 1].t = T.HOUSE; map[r0 - 1][c0 + 1].pop = 2;
+    map[r0 - 1][c0 + 5].t = T.HOUSE; map[r0 - 1][c0 + 5].pop = 1;
+    map[r0 - 1][c0 + 3].t = T.WELL;
+    map[r0 - 2][c0 + 1].t = T.FARM;
+    map[r0 - 2][c0 + 5].t = T.FACTORY;
+    map[r0 - 2][c0 + 8].t = T.SHOP;
+  }
+  placeStart();
+  buildHeights();
+
+  // ═══════════ 状态 ═══════════
+  const S = {
+    money: START_MONEY, pop: 0, net: 0, unemp: 0, t: 0,
+    status: "VILLAGE", msg: "", msgT: 0, won: false, sandbox: false,
+    demandR: 0, demandC: 0, demandI: 0
+  };
+  const TOOLS = [
+    { kind:"road",    name:"ROAD",   key:"1" },
+    { kind:"house",   name:"HOUSE",  key:"2" },
+    { kind:"shop",    name:"SHOP",   key:"3" },
+    { kind:"factory", name:"FACT",   key:"4" },
+    { kind:"farm",    name:"FARM",   key:"5" },
+    { kind:"well",    name:"WELL",   key:"6" },
+    { kind:"church",    name:"CHUR",  key:"7" },
+    { kind:"warehouse", name:"WHS",   key:"8" },
+    { kind:"market",    name:"MKT",   key:"9" },
+    { kind:"doze",      name:"DOZE",  key:"0" }
+  ];
+  let sel = 0, facing = 0;
+  let dragging = false, lastC = -99, lastR = -99;
+  let camX = 0, camY = 0, camInit = false;
+  let camDrag = false, camLastX = 0, camLastY = 0;
+  const mouse = { sx:0, sy:0, c:-1, r:-1, on:false };
+
+  function isoX(c, r) { return (c - r) * HW; }
+  function isoY(c, r) { return (c + r) * HH; }
+  function screenToTile(sx, sy) {
+    const x = sx - camX, y = sy - camY;
+    return { c: Math.floor((x / HW + y / HH) / 2), r: Math.floor((y / HH - x / HW) / 2) };
+  }
+
+  // ═══════════ 输入 ═══════════
+  cv.addEventListener("mousemove", e => {
+    const b = cv.getBoundingClientRect();
+    mouse.sx = (e.clientX - b.left) * (VW / b.width);
+    mouse.sy = (e.clientY - b.top) * (VH / b.height);
+    const t = screenToTile(mouse.sx, mouse.sy);
+    mouse.c = t.c; mouse.r = t.r;
+    mouse.on = t.c >= 0 && t.c < MAP && t.r >= 0 && t.r < MAP;
+    if (camDrag) {
+      camX += mouse.sx - camLastX; camY += mouse.sy - camLastY;
+      camLastX = mouse.sx; camLastY = mouse.sy; return;
+    }
+    if (dragging && mouse.on && (mouse.c !== lastC || mouse.r !== lastR)) {
+      build(); lastC = mouse.c; lastR = mouse.r;
+    }
+  });
+  cv.addEventListener("mouseleave", () => { mouse.on = false; });
+  cv.addEventListener("mousedown", e => {
+    e.preventDefault();
+    if (e.button === 2) { camDrag = true; camLastX = mouse.sx; camLastY = mouse.sy; return; }
+    dragging = true; lastC = -99; lastR = -99;
+    build(); lastC = mouse.c; lastR = mouse.r;
+  });
+  window.addEventListener("mouseup", () => { camDrag = false; dragging = false; });
+  cv.addEventListener("contextmenu", e => e.preventDefault());
+  cv.addEventListener("wheel", e => { e.preventDefault(); camY -= e.deltaY * 0.12; }, { passive:false });
+  window.addEventListener("keydown", e => {
+    if (/^Digit[1-7]$/.test(e.code)) sel = (+e.code.slice(5)) - 1;
+    if (e.code === "KeyB") { S.sandbox = !S.sandbox; say(S.sandbox ? "SANDBOX ON" : "SANDBOX OFF"); }
+    if (e.code === "KeyQ") facing = (facing + 3) % 4;
+    if (e.code === "KeyE") facing = (facing + 1) % 4;
+    if (e.code === "ArrowLeft") camX += 24;
+    if (e.code === "ArrowRight") camX -= 24;
+    if (e.code === "ArrowUp") camY += 16;
+    if (e.code === "ArrowDown") camY -= 16;
+  });
+
+  function say(t) { S.msg = t; S.msgT = 50; }
+
+  // ═══════════ 建造 ═══════════
+  function build() {
+    if (!mouse.on || S.won) return;
+    const cell = map[mouse.r][mouse.c];
+    const tool = TOOLS[sel];
+    if (tool.kind === "doze") {
+      if (cell.t === T.WATER) return say("CANNOT");
+      if (cell.t === T.GRASS || cell.t === T.GRASS2) return;
+      if (cell.t === T.HOUSE) houseCount--;
+      cell.t = T.GRASS; cell.pop = 0;
+      S.money -= 3;
+      return;
+    }
+    if (cell.t === T.WATER) return say("WATER");
+    if (cell.t !== T.GRASS && cell.t !== T.GRASS2 && cell.t !== T.TREE) return say("OCCUPIED");
+    const cost = COST[tool.kind];
+    if (!S.sandbox && S.money < cost) return say("NO MONEY");
+    const map2 = { road:T.ROAD, house:T.HOUSE, shop:T.SHOP, factory:T.FACTORY, farm:T.FARM, well:T.WELL, church:T.CHURCH, warehouse:T.WAREHOUSE, market:T.MARKET };
+    cell.t = map2[tool.kind];
+    cell.pop = 0;
+    cell.rot = facing;
+    if (tool.kind === "house") houseCount++;
+    if (!S.sandbox) S.money -= cost;
+  }
+
+  // ═══════════ 模拟 ═══════════
+  function counts() {
+    let road=0, house=0, shop=0, factory=0, farm=0, well=0, church=0, warehouse=0, market=0;
+    for (let r = 0; r < MAP; r++) for (let c = 0; c < MAP; c++) {
+      switch (map[r][c].t) {
+        case T.ROAD: road++; break;
+        case T.HOUSE: house++; break;
+        case T.SHOP: shop++; break;
+        case T.FACTORY: factory++; break;
+        case T.CHURCH: church++; break;
+        case T.WAREHOUSE: warehouse++; break;
+        case T.MARKET: market++; break;
+        case T.FARM: farm++; break;
+        case T.WELL: well++; break;
+      }
+    }
+    return { road, house, shop, factory, farm, well, church, warehouse, market };
+  }
+  function nearRoad(r, c) {
+    for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+      const rr = r + dr, cc = c + dc;
+      if (rr<0||rr>=MAP||cc<0||cc>=MAP) continue;
+      if (map[rr][cc].t === T.ROAD) return true;
+    }
+    return false;
+  }
+
+  function simulate() {
+    if (S.sandbox) { S.pop = 0; S.net = 0; return; }   // 沙盒模式不跑经济
+    if (S.won) return;
+    S.t++;
+    const n = counts();
+    const food = n.farm * FOOD_PER_FARM + n.warehouse * 12 + n.church * 6;
+    const needWater = n.house + n.shop + n.factory;
+    const water = Math.max(3, n.well * WATER_PER_WELL);
+    const enoughWater = water >= needWater;
+
+    const jobs = n.shop * CAP_SHOP + n.factory * CAP_FACTORY;
+    let total = 0;
+    for (let r = 0; r < MAP; r++) for (let c = 0; c < MAP; c++)
+      if (map[r][c].t === T.HOUSE) total += map[r][c].pop;
+
+    // 增长：每 2 回合让一栋"有路 + 有水 + 有粮"的房子 +1 人
+    if (S.t % 2 === 0 && enoughWater && total < food) {
+      for (let r = 0; r < MAP && true; r++) {
+        let done = false;
+        for (let c = 0; c < MAP; c++) {
+          const cell = map[r][c];
+          if (cell.t === T.HOUSE && cell.pop < CAP_HOUSE && nearRoad(r, c)) {
+            cell.pop++; total++; done = true; break;
+          }
+        }
+        if (done) break;
+      }
+    }
+
+    // 衰退：缺水 / 缺粮 / 失业太高
+    const unemp = total === 0 ? 0 : 1 - Math.min(total, jobs) / total;
+    if (S.t % 3 === 0 && (!enoughWater || total > food || unemp > 0.65)) {
+      for (let r = 0; r < MAP; r++) {
+        let done = false;
+        for (let c = 0; c < MAP; c++) {
+          if (map[r][c].t === T.HOUSE && map[r][c].pop > 0) {
+            map[r][c].pop--; total--; done = true; break;
+          }
+        }
+        if (done) break;
+      }
+    }
+
+    S.pop = total;
+    S.unemp = unemp;
+
+    const income = total * TAX_CITIZEN
+      + n.shop * TAX_SHOP * Math.min(1, total / Math.max(1, n.shop * 4))
+      + n.factory * TAX_FACTORY
+      + n.market * (total * 0.10);          // 市集：按人口产生销售额
+    const upkeep = (n.road*UPKEEP.road + n.house*UPKEEP.house + n.shop*UPKEEP.shop
+                  + n.factory*UPKEEP.factory + n.farm*UPKEEP.farm + n.well*UPKEEP.well
+                  + n.church*0.55 + n.warehouse*0.30 + n.market*0.35) * UPKEEP_MUL;
+    S.net = (income - upkeep) * TICK;
+    S.money += S.net;
+    if (S.money < 0) S.money = 0;
+
+    // 需求（给玩家方向）
+    S.demandR = Math.max(-1, Math.min(1, (jobs - total) / 12));
+    S.demandC = Math.max(-1, Math.min(1, (total / 4 - n.shop) / 6));
+    S.demandI = Math.max(-1, Math.min(1, (total / 8 - n.factory) / 5));
+
+    if (total >= GOAL_POP && !S.won) {
+      S.won = true;
+      S.status = "TOWN";
+      say("*** TOWN ***");
+    }
+  }
+
+  // ═══════════ 道路自动拼接 ═══════════
+  function isRoad(r, c) {
+    if (r<0||r>=MAP||c<0||c>=MAP) return false;
+    return map[r][c].t === T.ROAD;
+  }
+  function roadSprite(c, r) {
+    const w = isRoad(r, c-1), n = isRoad(r-1, c), e = isRoad(r, c+1), s = isRoad(r+1, c);
+    const key = "" + (w?1:0) + (n?1:0) + (e?1:0) + (s?1:0);
+    const tb = {
+      "0000":"road_iso", "0110":"road_ns", "1001":"road_ew", "1111":"road_cross",
+      "0111":"road_ne", "0011":"road_es", "1011":"road_sw", "1101":"road_wn",
+      "0100":"road_end_n", "0010":"road_end_s", "1000":"road_end_s", "0001":"road_end_n",
+      "1100":"road_ns", "0101":"road_ew", "1010":"road_ns"
+    };
+    return IMG[tb[key] || "road_iso"];
+  }
+
+  // ═══════════ 绘制 ═══════════
+  // 悬崖侧壁：相邻格比自己低时，画出竖直面
+  // 悬崖用岩石褐，和草地绿拉开对比（东南面亮、西南面暗 = 左上受光）
+  const CLIFF_COL = {
+    0: ["#8a6a42", "#5e472c"],
+    1: ["#8a6a42", "#5e472c"],
+    2: ["#2a6382", "#1b4760"],
+    3: ["#8a6a42", "#5e472c"],
+    5: ["#8a6a42", "#5e472c"],
+    7: ["#8a6a42", "#5e472c"]
+  };
+  function cliffColors(t) {
+    return CLIFF_COL[t] || CLIFF_COL[0];
+  }
+
+  function drawCliff(cell, c, r) {
+    const h0 = cell.h || 0;
+    const x = Math.round(isoX(c, r) + camX);
+    const y = Math.round(isoY(c, r) + camY) - h0 * ELEV_STEP;
+    const col = cliffColors(cell.t);
+
+    const hSE = (c + 1 < MAP) ? (map[r][c + 1].h || 0) : h0;
+    const hSW = (r + 1 < MAP) ? (map[r + 1][c].h || 0) : h0;
+    const dSE = hSE < h0 ? (h0 - hSE) * ELEV_STEP : 0;
+    const dSW = hSW < h0 ? (h0 - hSW) * ELEV_STEP : 0;
+
+    // 东南面
+    if (dSE > 0) {
+      ctx.fillStyle = col[0];
+      ctx.beginPath();
+      ctx.moveTo(x + HW, y + HH);
+      ctx.lineTo(x, y + TH);
+      ctx.lineTo(x, y + TH + dSE);
+      ctx.lineTo(x + HW, y + HH + dSE);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = "rgba(255,235,190,0.20)";
+      ctx.fillRect(x + 1, y + TH - 1, HW - 1, 1);
+      ctx.fillStyle = "rgba(0,0,0,0.18)";
+      ctx.fillRect(x + 5, y + TH - 3, 1, Math.min(dSE, 7));
+      ctx.fillRect(x + 11, y + TH - 2, 1, Math.min(dSE, 5));
+    }
+    // 西南面
+    if (dSW > 0) {
+      ctx.fillStyle = col[1];
+      ctx.beginPath();
+      ctx.moveTo(x, y + TH);
+      ctx.lineTo(x - HW, y + HH);
+      ctx.lineTo(x - HW, y + HH + dSW);
+      ctx.lineTo(x, y + TH + dSW);
+      ctx.closePath();
+      ctx.fill();
+    }
+    // 转角楔形：两面深度不同时，补上中间那个缺口
+    if (dSE > 0 && dSW > 0 && dSE !== dSW) {
+      const dMin = Math.min(dSE, dSW), dMax = Math.max(dSE, dSW);
+      ctx.fillStyle = col[0];
+      ctx.beginPath();
+      if (dSE > dSW) {
+        ctx.moveTo(x, y + TH + dSW);
+        ctx.lineTo(x, y + TH + dSE);
+        ctx.lineTo(x + HW * (dSE - dSW) / dSE, y + HH + dSE);
+      } else {
+        ctx.moveTo(x, y + TH + dSE);
+        ctx.lineTo(x, y + TH + dSW);
+        ctx.lineTo(x - HW * (dSW - dSE) / dSW, y + HH + dSW);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+  // 道路自动拼接：看四邻有没有路
+  function isRoadAt(r, c) {
+    if (r < 0 || r >= MAP || c < 0 || c >= MAP) return false;
+    return map[r][c].t === T.ROAD;
+  }
+  function roadSprite(c, r) {
+    const w = isRoadAt(r, c - 1), n = isRoadAt(r - 1, c), e = isRoadAt(r, c + 1), s = isRoadAt(r + 1, c);
+    const key = "" + (w?1:0) + (n?1:0) + (e?1:0) + (s?1:0);
+    const tb = {
+      "0000":"road_iso", "0110":"road_ns", "1001":"road_ew", "1111":"road_cross",
+      "0111":"road_ne", "0011":"road_es", "1011":"road_sw", "1101":"road_wn",
+      "0100":"road_end_n", "0010":"road_end_s", "1000":"road_end_s", "0001":"road_end_n",
+      "1100":"road_ns", "0101":"road_ew", "1010":"road_ns"
+    };
+    return IMG[tb[key] || "road_iso"] || IMG.road_0;
+  }
+  function drawTile(cell, c, r) {
+    const x = Math.round(isoX(c, r) + camX);
+    const y = Math.round(isoY(c, r) + camY) - (cell.h || 0) * ELEV_STEP;   // 抬升到该格高度
+    let img;
+    switch (cell.t) {
+      case T.WATER:   img = IMG.water_0; break;
+      case T.ROAD:    img = roadSprite(c, r); break;
+      case T.FARM:    img = IMG.farm_0; break;
+      case T.HOUSE:   img = IMG[(cell.rot % 2) ? "house_1" : "house_0"]; break;
+      case T.SHOP:    img = IMG[(cell.rot % 2) ? "shop_1" : "shop_0"]; break;
+      case T.FACTORY: img = IMG[(cell.rot % 2) ? "factory_1" : "factory_0"]; break;
+      case T.CHURCH:    img = IMG.church_0; break;
+      case T.WAREHOUSE: img = IMG.factory_1; break;
+      case T.MARKET:    img = IMG.market_0; break;
+      case T.TREE:    img = IMG["tree_" + (cell.tv % 2)]; break;
+      case T.WELL:    img = IMG.well_0; break;
+      case T.GRASS:   img = IMG.grass_0; break;
+      default:        img = IMG.grass_0;
+    }
+    if (!img || !img.complete || img.naturalWidth === 0) return;
+    // 地面贴图带 1 像素外扩，向左上偏 1 消除缝隙
+    const isGround = (cell.t === T.GRASS || cell.t === T.WATER || cell.t === T.ROAD);
+    const dx = isGround ? (x - HW - 2) : (x - HW);
+    const dy = isGround ? (y - 2) : (y - (img.height - TH));
+    ctx.drawImage(img, dx, dy);
+    if (cell.t === T.HOUSE && cell.pop > 0) {
+      ctx.fillStyle = "#ecd97c";
+      for (let i = 0; i < cell.pop; i++) ctx.fillRect(x - 4 + i*2, dy + 2, 2, 2);
+    }
+  }
+
+  function fill(c) { ctx.fillStyle = c; }
+  function rect(x,y,w,h) { ctx.fillRect(x|0,y|0,w|0,h|0); }
+
+  const FONT = {
+    "0":[7,5,5,5,7],"1":[2,6,2,2,7],"2":[7,1,7,4,7],"3":[7,1,7,1,7],"4":[5,5,7,1,1],
+    "5":[7,4,7,1,7],"6":[7,4,7,5,7],"7":[7,1,1,1,1],"8":[7,5,7,5,7],"9":[7,5,7,1,7],
+    "A":[2,5,7,5,5],"B":[6,5,6,5,6],"C":[3,4,4,4,3],"D":[6,5,5,5,6],"E":[7,4,6,4,7],
+    "F":[7,4,6,4,4],"G":[3,4,5,5,3],"H":[5,5,7,5,5],"I":[7,2,2,2,7],"J":[1,1,1,5,2],
+    "K":[5,5,6,5,5],"L":[4,4,4,4,7],"M":[5,7,7,5,5],"N":[5,7,7,7,5],"O":[2,5,5,5,2],
+    "P":[6,5,6,4,4],"Q":[2,5,5,6,3],"R":[6,5,6,5,5],"S":[3,4,2,1,6],"T":[7,2,2,2,2],
+    "U":[5,5,5,5,3],"V":[5,5,5,5,2],"W":[5,5,7,7,5],"X":[5,5,2,5,5],"Y":[5,5,2,2,2],
+    "Z":[7,1,2,4,7]," ":[0,0,0,0,0],"/":[1,1,2,4,4],"+":[0,2,7,2,0],"-":[0,0,7,0,0],
+    ".":[0,0,0,0,2],"%":[5,1,2,4,5]
+  };
+  function text(s,x,y,col,sc) {
+    const k = sc||1;
+    ctx.fillStyle = col;
+    let cx = x;
+    for (const ch of String(s).toUpperCase()) {
+      const g = FONT[ch];
+      if (!g) { cx += 4*k; continue; }
+      for (let r = 0; r < 5; r++)
+        for (let q = 0; q < 3; q++)
+          if (g[r] & (4>>q)) ctx.fillRect(cx + q*k, y + r*k, k, k);
+      cx += 4*k;
+    }
+  }
+
+  // 世界坐标噪点（确定性哈希，同一世界位置永远一样，所以移动视角不会闪）
+  function hash2(x, y) {
+    let n = x * 374761393 + y * 668265263;
+    n = (n ^ (n >> 13)) * 1274126177;
+    return ((n ^ (n >> 16)) >>> 0) / 4294967296;
+  }
+  function drawWorldNoise() {
+    const step = 5;                    // 每 5 世界像素检查一次
+    const x0 = Math.floor(-camX / step) * step;
+    const y0 = Math.floor(-camY / step) * step;
+    for (let wy = y0; wy < y0 + VH * 2; wy += step) {
+      for (let wx = x0; wx < x0 + VW * 2; wx += step) {
+        const sx = wx + camX, sy = wy + camY;
+        if (sx < 0 || sx >= VW || sy < HUD_H || sy >= VH) continue;
+        const h1 = hash2(wx, wy);
+        if (h1 > 0.82) continue;       // 只有 18% 的点有噪点（柔和）
+        const h2 = hash2(wx + 7, wy + 3);
+        if (h2 < 0.40) ctx.fillStyle = "rgba(255,255,255,0.10)";
+        else if (h2 < 0.80) ctx.fillStyle = "rgba(0,0,0,0.10)";
+        else ctx.fillStyle = "rgba(0,0,0,0.20)";
+        ctx.fillRect(sx | 0, sy | 0, 1, 1);
+      }
+    }
+  }
+  function demandBar(x, y, label, v) {
+    text(label, x, y, "#9daab4", 1);
+    const bx = x + 6, by = y, bh = 5, mid = by + 2;
+    fill("#1b2227"); rect(bx, by, 24, bh);
+    if (v >= 0) { fill("#5fbf6a"); rect(bx + 12, mid - 1, Math.round(12 * v), 2); }
+    else { fill("#d0644a"); rect(bx + 12 + Math.round(12 * v), mid - 1, Math.round(-12 * v), 2); }
+    fill("#3b4750"); rect(bx + 12, by, 1, bh);
+  }
+
+  function draw() {
+    if (loaded < total) {
+      fill("#0a0f14"); rect(0,0,VW,VH);
+      text("LOADING " + loaded + "/" + total, VW/2 - 26, VH/2, "#d2dae0", 2);
+      return;
+    }
+    if (!camInit) {
+      camX = VW/2 - isoX(MAP/2, MAP/2) - HW;
+      camY = VH/2 - isoY(MAP/2, MAP/2) + 26;
+      camInit = true;
+    }
+
+    for (let y = 0; y < VH; y += 8) { fill(y < VH/2 ? "#0e1a2a" : "#12202e"); rect(0,y,VW,8); }
+
+    // 先铺一层草地底色，任何残余缝隙都不会露出黑底
+    fill("#5f8f45");
+    rect(0, HUD_H, VW, VH - HUD_H);
+
+    const vis = [];
+    for (let d = 0; d <= (MAP-1)*2; d++) {
+      for (let r = 0; r < MAP; r++) {
+        const c = d - r;
+        if (c < 0 || c >= MAP) continue;
+        const x = isoX(c,r) + camX, y = isoY(c,r) + camY;
+        if (x < -TW || x > VW+TW || y < -180 || y > VH+TH) continue;
+        vis.push([c, r]);
+      }
+    }
+    // 第一遍：所有悬崖侧壁
+    for (const v of vis) drawCliff(map[v[1]][v[0]], v[0], v[1]);
+    // 第二遍：所有砖面
+    for (const v of vis) drawTile(map[v[1]][v[0]], v[0], v[1]);
+
+    // 世界坐标噪点（不按格子重复）
+    drawWorldNoise();
+
+    if (mouse.on && !S.won) {
+      const x = isoX(mouse.c, mouse.r) + camX, y = isoY(mouse.c, mouse.r) + camY;
+      const tool = TOOLS[sel], cell = map[mouse.r][mouse.c];
+      const ok = tool.kind === "doze"
+        ? (cell.t !== T.GRASS && cell.t !== T.GRASS2 && cell.t !== T.WATER)
+        : ((cell.t === T.GRASS || cell.t === T.GRASS2 || cell.t === T.TREE) && S.money >= COST[tool.kind]);
+      ctx.strokeStyle = ok ? "#ecd97c" : "#cc4028";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x,y); ctx.lineTo(x+HW,y+HH); ctx.lineTo(x,y+TH); ctx.lineTo(x-HW,y+HH);
+      ctx.closePath(); ctx.stroke();
+      ctx.fillStyle = ok ? "rgba(236,217,124,0.20)" : "rgba(204,64,40,0.20)";
+      ctx.fill();
+    }
+
+    // ── HUD ──
+    fill("#0c1013"); rect(0,0,VW,HUD_H);
+    fill("#1b2227"); rect(0,HUD_H-1,VW,1);
+
+    fill("#e0b04a"); rect(4,5,10,10); fill("#f7efba"); rect(6,7,6,6);
+    text(S.sandbox ? "INF" : ("" + Math.floor(S.money)), 18, 6, S.sandbox ? "#7fe07f" : "#f2f6f9", 2);
+
+    fill("#c9a06a"); rect(88,5,5,5); rect(96,5,5,5); rect(92,10,5,5);
+    text(S.pop + "/" + GOAL_POP, 106, 6, "#f2f6f9", 2);
+
+    text((S.net>=0?"+":"") + S.net.toFixed(1), 168, 8, S.net>=0?"#ecd97c":"#d0644a", 1);
+    text(S.sandbox ? "SANDBOX" : S.status, 200, 6, S.sandbox ? "#7fe07f" : (S.won ? "#ecd97c" : "#9daab4"), 2);
+
+    // 需求条
+    demandBar(4, 20, "R", S.demandR);
+    demandBar(52, 20, "C", S.demandC);
+    demandBar(100, 20, "I", S.demandI);
+    text("JOB " + (S.unemp*100).toFixed(0) + "%", 152, 22, S.unemp>0.5?"#d0644a":"#9daab4", 1);
+
+    // 工具条（底部，10 格）
+    let bx = 6;
+    for (let i = 0; i < TOOLS.length; i++) {
+      const t = TOOLS[i], on = i === sel;
+      fill(on ? "#e0b04a" : "#1b2227"); rect(bx, VH-14, 36, 12);
+      fill(on ? "#3d3110" : "#0c1013"); rect(bx+1, VH-13, 34, 10);
+      text(t.key, bx + 2, VH-10, on ? "#ecd97c" : "#7b8894", 1);
+      text(t.name.slice(0,3), bx + 8, VH-10, on ? "#ecd97c" : "#7b8894", 1);
+      bx += 38;
+    }
+
+    text("Q/E " + ["N","E","S","W"][facing], VW - 30, 20, "#ecd97c", 1);
+
+    if (S.msgT > 0) { S.msgT--; text(S.msg, VW/2 - S.msg.length*2, HUD_H + 4, "#ecd97c", 2); }
+
+    if (S.won) {
+      fill("rgba(0,0,0,0.62)"); rect(0,0,VW,VH);
+      text("TOWN REACHED", VW/2 - 44, VH/2 - 18, "#ecd97c", 3);
+      text("POP " + S.pop, VW/2 - 16, VH/2 + 10, "#f2f6f9", 2);
+      text("MONEY " + Math.floor(S.money), VW/2 - 26, VH/2 + 26, "#f2f6f9", 2);
+    }
+  }
+
+  let acc = 0, last = 0;
+  function loop(t) {
+    requestAnimationFrame(loop);
+    if (!last) last = t;
+    acc += Math.min(t - last, 200); last = t;
+    while (acc >= TICK * 1000) { acc -= TICK * 1000; simulate(); }
+    draw();
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
